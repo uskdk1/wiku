@@ -1,0 +1,471 @@
+#!/usr/bin/env bash
+# wiku: 여러 Wine 변형과 여러 prefix 를 관리하고, prefix 마다 정해진 Wine 으로 실행한다.
+#
+# 실행
+#   wiku app.exe                     기본 prefix 로 실행
+#   wiku kakao app.exe               kakao prefix 로 실행
+#   wiku kakao "C:\\...\\앱.lnk"     설치한 앱 (바로가기 .lnk 또는 .exe)
+#   wiku kakao --reset [app.exe]     prefix 초기화 (drive_c, 레지스트리, 메뉴 항목) + 바로 실행
+#   wiku kakao --kill                이 prefix 의 Wine 프로세스 전부 종료 (트레이에 숨은 앱 포함)
+#   wiku --kill-all                  설정된 Wine 들로 뜬 모든 prefix 의 프로세스 종료
+#   WIKU_LANG=ja_JP.UTF-8 wiku ...   이번만 로캘 바꾸기
+#
+# 관리
+#   wiku list                        prefix 목록 (* = 기본, home = home.nix, user = wiku add)
+#   wiku wines                       Wine 변형 목록
+#   wiku add <이름> <wine> [옵션]    prefix 추가 (처음 실행할 때 만든다)
+#   wiku set <이름> [옵션]           wiku add 로 만든 prefix 설정 바꾸기
+#   wiku rm <이름> [-y]              prefix 삭제 (데이터, 메뉴 항목. add 로 만든 것은 설정도)
+#     옵션: --wine <wine>  --locale <LANG|default>  --wayland <on|off|default>
+#           --dxvk <on|off|default>  --file-assoc <on|off|default>  --path <디렉터리|default>
+#           --env K=V  --unset-env K
+#     file-assoc: Wine 파일 연결(.reg, .chm 등을 Wine 으로 열기) 만들기. 이름이 prefix 공통이라
+#                 켠 prefix 끼리 덮어쓴다. 기본은 끔
+#
+# 설정: 래퍼가 넘기는 WIKU_CONFIG (nix store, home.nix 에서 선언한 wine/prefix) +
+#       ~/.config/wiku/prefixes.json (wiku add/set 으로 만든 prefix). 이름이 겹치면 home.nix 쪽.
+# 앱 바로가기(.desktop)는 `env WINEPREFIX=<경로> wiku ...` 로 부르므로 (WINEMENUBUILDER_LAUNCHER)
+# 첫 인자가 prefix 이름이 아니면 WINEPREFIX 로 prefix 를 찾는다.
+# prefix 가 없으면 깨끗한 템플릿(~/.cache/wiku/templates, Wine+설정이 같은 prefix 끼리 공유)에서
+# 즉시 만들고, Wine 이 바뀌면 wineboot -u 로 갱신한다 (Nix store mtime 이 1 이라 Wine 이 스스로 못 한다).
+set -o pipefail
+
+CONFIG="${WIKU_CONFIG:-}"
+# WIKU_USER_CONFIG / WIKU_TEMPLATES: 위치 바꾸기 (패치셋 개발 셸이 자기 것만 쓰게)
+USER_CONFIG="${WIKU_USER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/wiku/prefixes.json}"
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}/wiku"
+TEMPLATES="${WIKU_TEMPLATES:-${XDG_CACHE_HOME:-$HOME/.cache}/wiku/templates}"
+RESERVED="list wines add set rm help"
+DXVK_DLLS="d3d8 d3d9 d3d10core d3d11 dxgi"
+
+die() { echo "wiku: $*" >&2; exit 1; }
+say() { echo "wiku: $*" >&2; }
+
+[ -f "$CONFIG" ] || die "설정 파일이 없음 (WIKU_CONFIG=$CONFIG)"
+
+# ---------------------------------------------------------------- 설정
+
+# store 설정 + 사용자 설정을 합친 JSON. prefix 에 source(home|user) 를 붙인다
+merged_config() {
+    local u='{}'
+    if [ -f "$USER_CONFIG" ]; then
+        u=$(jq -c . "$USER_CONFIG") || die "$USER_CONFIG 가 올바른 JSON 이 아님"
+    fi
+    jq -c --argjson u "$u" '
+        . as $s | ($u.prefixes // {}) as $up
+        | { default: ($s.default // $u.default),
+            wines: $s.wines,
+            prefixes: (($up | map_values(. + {source: "user"}))
+                       + ($s.prefixes | map_values(. + {source: "home"}))) }' "$CONFIG"
+}
+CONF=$(merged_config) || exit 1
+
+q() { jq -r "$@" <<<"$CONF"; }
+names() { q '.prefixes | keys[]'; }
+has_prefix() { [ -n "$1" ] && jq -e --arg p "$1" '.prefixes | has($p)' <<<"$CONF" >/dev/null; }
+has_wine() { [ -n "$1" ] && jq -e --arg w "$1" '.wines | has($w)' <<<"$CONF" >/dev/null; }
+prefix_dir() { local d; d=$(q --arg p "$1" '.prefixes[$p].path // empty'); echo "${d:-$DATA/$1}"; }
+default_prefix() { q '.default // empty'; }
+
+# prefix 하나의 설정을 셸 변수로: NAME PREFIX WINE_NAME RT SHARE LOCALE WAYLAND DXVK FILE_ASSOC OVERRIDE SOURCE
+# (+ env 를 export). 설정 = wine 의 defaults <- prefix 에서 null 이 아닌 값
+load() {
+    NAME="$1"
+    local wine; wine=$(q --arg p "$NAME" '.prefixes[$p].wine')
+    has_wine "$wine" || die "prefix '$NAME' 의 wine '$wine' 이 이 wiku 에 없음 ('wiku wines' 참고)"
+    eval "$(q --arg p "$NAME" '
+        .prefixes[$p] as $x | .wines[$x.wine] as $w
+        | ($w.defaults + ($x | with_entries(select((.key | IN("locale", "wayland", "dxvk", "fileAssoc"))
+                                                   and .value != null)))) as $s
+        | @sh "WINE_NAME=\($x.wine) RT=\($w.runtime) SHARE=\($w.shares["\($s.wayland)-\($s.dxvk)-\($s.fileAssoc)"])",
+          @sh "LOCALE=\($s.locale // "") WAYLAND=\($s.wayland) DXVK=\($s.dxvk) FILE_ASSOC=\($s.fileAssoc)",
+          @sh "OVERRIDE=\($x.override // "") SOURCE=\($x.source)",
+          (($w.env + ($x.env // {})) | to_entries[] | "export \(.key)=\(.value | @sh)")')" ||
+        die "설정 읽기 실패 ($NAME)"
+    PREFIX="${PREFIX:-$(prefix_dir "$NAME")}"
+    WINE="$RT/bin/wine"
+    WINESERVER="$RT/bin/wineserver"
+}
+
+# 사용자 설정 고치기: jq 필터를 사용자 설정 파일에 적용 (원자적으로)
+edit_user_config() {
+    local cur='{}' tmp
+    [ -f "$USER_CONFIG" ] && cur=$(jq -c . "$USER_CONFIG")
+    mkdir -p "$(dirname "$USER_CONFIG")"
+    tmp="$USER_CONFIG.tmp.$$"
+    jq "$@" <<<"$cur" > "$tmp" && mv -f "$tmp" "$USER_CONFIG" || { rm -f "$tmp"; die "설정 저장 실패"; }
+}
+
+# ---------------------------------------------------------------- 보기
+
+usage() {
+    sed -n '2,/^[^#]/{/^#/{s/^# \{0,1\}//;p}}' "$0" >&2
+    echo >&2
+    list >&2
+}
+
+list() {
+    local def n p mark
+    def=$(default_prefix)
+    while IFS= read -r n; do
+        mark=' '; [ "$n" = "$def" ] && mark='*'
+        printf '%s %-12s %-12s %-5s %s\n' "$mark" "$n" "$(q --arg p "$n" '.prefixes[$p].wine')" \
+            "$(q --arg p "$n" '.prefixes[$p].source')" "$(prefix_dir "$n")"
+    done < <(names)
+    # 설정에서 빠졌는데 데이터가 남은 prefix (기본 위치만 본다)
+    for p in "$DATA"/*/; do
+        p="${p%/}"; n="${p##*/}"
+        [ -f "$p/.wiku-prefix" ] || continue
+        has_prefix "$n" && [ "$(prefix_dir "$n")" = "$p" ] && continue
+        printf '! %-12s %-12s %-5s %s   (설정에 없음. 지우려면 rm -rf)\n' "$n" "-" "-" "$p"
+    done
+    [ -n "$def" ] || echo "(기본 prefix 없음: 실행할 때 prefix 이름을 줄 것)"
+}
+
+wines() {
+    local w ver defs used
+    while IFS=$'\t' read -r w ver defs used; do
+        printf '%-12s %-10s %-44s %s\n' "$w" "$ver" "$defs" "${used:--}"
+    done < <(q '. as $c | .wines | keys[] as $w | $c.wines[$w] as $x
+        | [$w, $x.version,
+           ($x.defaults | "locale=\(.locale // "-") wayland=\(.wayland) dxvk=\(.dxvk) fileAssoc=\(.fileAssoc)"),
+           ([$c.prefixes | to_entries[] | select(.value.wine == $w) | .key] | join(","))] | @tsv')
+}
+
+# ---------------------------------------------------------------- add / set / rm
+
+valid_name() {
+    [[ "$1" =~ ^[A-Za-z0-9._][A-Za-z0-9._-]*$ ]] || die "prefix 이름은 영문·숫자·._- 만 ('-' 로 시작 불가): $1"
+    [[ " $RESERVED " != *" $1 "* ]] || die "'$1' 은 명령 이름이라 prefix 이름으로 쓸 수 없음"
+}
+
+onoff() {
+    case "$1" in
+        on|true|1) echo true ;;
+        off|false|0) echo false ;;
+        default) echo null ;;
+        *) die "on / off / default 중 하나: $1" ;;
+    esac
+}
+
+# 옵션 -> 사용자 설정의 prefix 항목($ENTRY, JSON)에 반영
+apply_opts() {
+    local v
+    while [ $# -gt 0 ]; do
+        [ $# -ge 2 ] || die "$1 의 값이 없음"
+        case "$1" in
+            --wine) has_wine "$2" || die "wine '$2' 이 없음 ('wiku wines' 참고)"
+                ENTRY=$(jq -c --arg v "$2" '.wine = $v' <<<"$ENTRY") ;;
+            --locale) if [ "$2" = default ]; then ENTRY=$(jq -c '.locale = null' <<<"$ENTRY")
+                else ENTRY=$(jq -c --arg v "$2" '.locale = $v' <<<"$ENTRY"); fi ;;
+            --wayland|--dxvk) v=$(onoff "$2") || exit 1
+                ENTRY=$(jq -c --arg k "${1#--}" --argjson v "$v" '.[$k] = $v' <<<"$ENTRY") ;;
+            --file-assoc) v=$(onoff "$2") || exit 1
+                ENTRY=$(jq -c --argjson v "$v" '.fileAssoc = $v' <<<"$ENTRY") ;;
+            --path) if [ "$2" = default ]; then ENTRY=$(jq -c '.path = null' <<<"$ENTRY")
+                else
+                    [[ "$2" = /* ]] || die "--path 는 절대 경로로: $2"
+                    ENTRY=$(jq -c --arg v "${2%/}" '.path = $v' <<<"$ENTRY")
+                fi ;;
+            --env) [[ "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die "--env 는 이름=값: $2"
+                ENTRY=$(jq -c --arg k "${2%%=*}" --arg v "${2#*=}" '.env[$k] = $v' <<<"$ENTRY") ;;
+            --unset-env) ENTRY=$(jq -c --arg k "$2" 'del(.env[$k])' <<<"$ENTRY") ;;
+            *) die "모르는 옵션: $1" ;;
+        esac
+        shift 2
+    done
+}
+
+cmd_add() {
+    local name="$1" wine="$2"
+    [ -n "$name" ] && [ -n "$wine" ] || die "사용법: wiku add <이름> <wine> [옵션]"
+    shift 2
+    valid_name "$name"
+    has_prefix "$name" && die "prefix '$name' 이 이미 있음 ($(q --arg p "$name" '.prefixes[$p].source'))"
+    has_wine "$wine" || die "wine '$wine' 이 없음 ('wiku wines' 참고)"
+    ENTRY=$(jq -cn --arg w "$wine" '{wine: $w, locale: null, wayland: null, dxvk: null, fileAssoc: null, env: {}, path: null}')
+    apply_opts "$@"
+    edit_user_config --arg p "$name" --argjson e "$ENTRY" '.prefixes[$p] = $e'
+    CONF=$(merged_config) || exit 1
+    say "추가: $name ($wine) -> $(prefix_dir "$name")  (처음 실행할 때 만든다)"
+}
+
+cmd_set() {
+    local name="$1" old_path
+    [ -n "$name" ] && [ $# -ge 3 ] || die "사용법: wiku set <이름> <옵션> <값> ..."
+    shift
+    has_prefix "$name" || die "prefix '$name' 이 없음"
+    [ "$(q --arg p "$name" '.prefixes[$p].source')" = user ] ||
+        die "'$name' 은 home.nix 에서 선언한 prefix 라서 home.nix 에서 바꿔야 함"
+    old_path=$(prefix_dir "$name")
+    ENTRY=$(q -c --arg p "$name" '.prefixes[$p] | del(.source)')
+    apply_opts "$@"
+    edit_user_config --arg p "$name" --argjson e "$ENTRY" '.prefixes[$p] = $e'
+    CONF=$(merged_config) || exit 1
+    say "변경: $name (다음 실행 때 적용)"
+    if [ "$(prefix_dir "$name")" != "$old_path" ] && [ -d "$old_path" ]; then
+        say "경로가 바뀜. 예전 데이터는 그대로 남음: $old_path"
+    fi
+    gc_templates
+}
+
+cmd_rm() {
+    local name="$1" yes="$2" answer
+    [ -n "$name" ] || die "사용법: wiku rm <이름> [-y]"
+    has_prefix "$name" || die "prefix '$name' 이 없음"
+    load "$name"
+    if [ "$yes" != -y ]; then
+        [ -t 0 ] || die "확인할 수 없음. 지우려면: wiku rm $name -y"
+        read -r -p "wiku: '$name' 의 prefix($PREFIX)와 그 안에 설치한 앱을 모두 지울까요? [y/N] " answer
+        [[ "$answer" = [yY]* ]] || die "취소"
+    fi
+    [ -e "$PREFIX" ] && delete_prefix
+    clean_menus
+    if [ "$SOURCE" = user ]; then
+        edit_user_config --arg p "$name" 'del(.prefixes[$p])'
+        CONF=$(merged_config) || exit 1
+        say "삭제: $name (설정도 지움)"
+    else
+        say "삭제: $name 의 데이터 (home.nix 에는 남아 있어서 다음 실행 때 다시 만든다)"
+    fi
+    gc_templates
+}
+
+# ---------------------------------------------------------------- prefix
+
+# 이 prefix 의 Wine 프로세스 전부 종료 (트레이에 숨은 앱, services/explorer 등)
+kill_prefix() {
+    local p="$1" server="$2"
+    WINEPREFIX="$p" "$server" -k 2>/dev/null || return 0
+    WINEPREFIX="$p" timeout 10 "$server" -w 2>/dev/null
+    say "종료: $p"
+}
+
+# 설정에 있는 wine 들의 wineserver 로 뜬 프로세스만 (다른 Wine 설치는 건드리지 않음)
+kill_all() {
+    local servers pid exe p r n=0
+    servers=$(q '.wines[].runtime' | sort -u | while IFS= read -r r; do readlink -f "$r/bin/wineserver"; done)
+    for pid in $(pgrep -x wineserver); do
+        exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null) || continue
+        grep -qxF "$exe" <<<"$servers" || continue
+        p=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^WINEPREFIX=//p')
+        [ -n "$p" ] || p="$HOME/.wine"
+        kill_prefix "$p" "$exe"; n=$((n + 1))
+    done
+    [ $n = 0 ] && say "실행 중인 Wine 없음"
+    return 0
+}
+
+# (개발용) override/<경로> -> runtime/<경로>. 바뀌면 이전 wineserver 를 내려서 새 바이너리로 다시 뜨게 한다
+sync_override() {
+    [ -n "$OVERRIDE" ] && [ -d "$OVERRIDE" ] && [ -w "$RT" ] || return 0
+    local src rel changed=0
+    while IFS= read -r -d '' src; do
+        rel="${src#"$OVERRIDE"/}"
+        if ! cmp -s "$src" "$RT/$rel"; then
+            mkdir -p "$(dirname "$RT/$rel")"
+            rm -f "$RT/$rel"; cp "$src" "$RT/$rel"; changed=1
+        fi
+    done < <(find "$OVERRIDE" -type f -print0)
+    if [ $changed = 1 ]; then "$WINESERVER" -k 2>/dev/null; true; fi
+}
+
+# 쓰고 있는 Wine 빌드 (store 경로들)
+wine_id() { cat "$RT/.wiku-wine" 2>/dev/null || cat "$RT/.vanilla" 2>/dev/null || readlink -f "$RT"; }
+
+# Wine 빌드 + prefix 데이터(레지스트리, 폰트, DXVK)가 같으면 같은 prefix 로 본다
+prefix_key() {
+    { wine_id; readlink -f "$SHARE" "$SHARE"/*; cat "$SHARE"/*.reg 2>/dev/null; } | sha256sum | cut -d' ' -f1
+}
+
+# 설정에 있는 어느 prefix 도 쓰지 않는 템플릿 삭제
+gc_templates() {
+    [ -d "$TEMPLATES" ] || return 0
+    local keys n t
+    keys=$(names | while IFS= read -r n; do ( load "$n" >/dev/null 2>&1 && prefix_key ); done)
+    for t in "$TEMPLATES"/*; do
+        [ -e "$t" ] || continue
+        grep -qxF "${t##*/}" <<<"$keys" && continue
+        rm -rf "$t"
+    done
+}
+
+# 이 prefix 를 가리키는 앱 메뉴 항목(.desktop / .menu) 삭제. 다른 prefix 것은 건드리지 않는다
+clean_menus() {
+    local apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    local menus="${XDG_CONFIG_HOME:-$HOME/.config}/menus/applications-merged"
+    local f id n=0
+    [ -d "$apps" ] || return 0
+    while IFS= read -r -d '' f; do
+        id="${f#"$apps"/}"; id="${id//\//-}"
+        rm -f "$f" "$menus/${id%.desktop}.menu"
+        n=$((n + 1))
+    done < <(grep -rlZF --include='*.desktop' "\"WINEPREFIX=$PREFIX\"" "$apps" 2>/dev/null)
+    find "$apps/wine" -mindepth 1 -type d -empty -delete 2>/dev/null
+    [ $n -gt 0 ] && say "메뉴 항목 ${n}개 삭제"
+    return 0
+}
+
+# prefix 디렉터리 삭제. 안전장치: wiku(또는 예전 winemiku)가 만든 prefix 만
+delete_prefix() {
+    local m ok=0
+    [ -e "$PREFIX" ] || return 0
+    for m in .wiku-prefix .wiku-prefix.tmp .wm-prefix .wm-prefix.tmp; do [ -f "$PREFIX/$m" ] && ok=1; done
+    [ $ok = 1 ] || die "$PREFIX 는 wiku 가 만든 prefix 가 아니라서 지우지 않음"
+    "$WINESERVER" -k 2>/dev/null
+    "$WINESERVER" -w 2>/dev/null
+    rm -rf "$PREFIX"
+}
+
+reset_prefix() {
+    delete_prefix
+    clean_menus
+    say "prefix 초기화: $PREFIX"
+}
+
+# 기존 prefix 에 Wine 갱신 + DXVK + 변형의 폰트 + 레지스트리 적용
+setup_prefix() {
+    local f dll sys32="$PREFIX/drive_c/windows/system32" wow64="$PREFIX/drive_c/windows/syswow64"
+    # Wine 이 바뀌었으면 prefix 의 system32/syswow64 (새 DLL 등)를 갱신한다. Wine 은 wine.inf 의
+    # mtime 이 .update-timestamp 와 다를 때만 스스로 갱신하는데, Nix store 는 mtime 이 항상 1 이라
+    # 버전을 바꿔도 갱신되지 않는다. DXVK 는 아래에서 다시 덮어쓴다.
+    if [ "$(cat "$PREFIX/.wiku-wine" 2>/dev/null)" != "$(wine_id)" ]; then
+        WINEDLLOVERRIDES="winemenubuilder.exe=d${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}" \
+            "$WINE" wineboot -u >/dev/null 2>&1
+        # wineboot 이 시작 프로그램(Run 키)까지 띄워서 -w 가 끝나지 않는다
+        "$WINESERVER" -k 2>/dev/null; "$WINESERVER" -w
+        wine_id > "$PREFIX/.wiku-wine"
+        rm -f "$PREFIX/.wm-wine"
+    fi
+    if [ -d "$SHARE/dxvk" ]; then
+        # DXVK: D3D -> Vulkan
+        for dll in $DXVK_DLLS; do
+            cp -f --remove-destination "$SHARE/dxvk/x64/$dll.dll" "$sys32/$dll.dll" &&
+            cp -f --remove-destination "$SHARE/dxvk/x32/$dll.dll" "$wow64/$dll.dll" || die "DXVK 설치 실패 ($dll)"
+        done
+        touch "$PREFIX/.wiku-dxvk"
+    elif [ -f "$PREFIX/.wiku-dxvk" ]; then
+        # DXVK 를 껐다: 넣었던 DLL 을 Wine 내장 DLL 로 되돌린다 (override 는 wiku.reg 가 지운다).
+        # 내장본이 없으면 (예: 64비트 d3d8) DXVK 파일만 지운다
+        restore() {
+            if [ -f "$1" ]; then cp -f --remove-destination "$1" "$2"; else rm -f "$2"; fi ||
+                die "내장 DLL 복구 실패 ($2)"
+        }
+        for dll in $DXVK_DLLS; do
+            restore "$RT/lib/wine/x86_64-windows/$dll.dll" "$sys32/$dll.dll"
+            restore "$RT/lib/wine/i386-windows/$dll.dll" "$wow64/$dll.dll"
+        done
+        rm -f "$PREFIX/.wiku-dxvk"
+    fi
+    if [ -d "$SHARE/fonts" ]; then
+        mkdir -p "$PREFIX/drive_c/windows/Fonts"
+        for f in "$SHARE"/fonts/*; do
+            ln -sfn "$f" "$PREFIX/drive_c/windows/Fonts/${f##*/}"
+        done
+    fi
+    # 파일 연결을 껐으면 이 prefix 가 예전에 만든 wine-extension-*.desktop 을 지운다 (앱 메뉴는 그대로)
+    if [ "$FILE_ASSOC" != true ]; then
+        local apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+        grep -lZF "\"WINEPREFIX=$PREFIX\"" "$apps"/wine-extension-*.desktop 2>/dev/null | xargs -0 -r rm -f
+    fi
+    # 레지스트리: 변형의 prefix.reg 다음에 wiku 토글(wiku.reg) -> 토글이 이긴다
+    for f in prefix.reg wiku.reg; do
+        [ -f "$SHARE/$f" ] || continue
+        cp -f "$SHARE/$f" "$PREFIX/.wiku-$f"
+        "$WINE" regedit /S "Z:${PREFIX//\//\\}\\.wiku-$f" >/dev/null 2>&1 || die "레지스트리 적용 실패 ($f)"
+    done
+    "$WINESERVER" -w
+    prefix_key > "$PREFIX/.wiku-prefix"
+}
+
+ensure_prefix() {
+    local key template
+    key=$(prefix_key) template="$TEMPLATES/$key"
+    if [ -e "$PREFIX" ] && [ ! -d "$PREFIX/drive_c" ]; then
+        say "drive_c 가 없음 -> prefix 를 새로 만든다"
+        reset_prefix
+    fi
+    if [ ! -d "$PREFIX" ]; then
+        if [ -f "$template/.wiku-prefix" ]; then
+            mkdir -p "$(dirname "$PREFIX")"
+            cp -a --reflink=auto "$template" "$PREFIX" || die "템플릿 복사 실패"
+            say "prefix 생성 (템플릿): $PREFIX"
+            return 0
+        fi
+        say "prefix 생성 중 (처음 한 번은 오래 걸림): $PREFIX"
+        mkdir -p "$PREFIX"; echo "$key" > "$PREFIX/.wiku-prefix.tmp"
+        # 만드는 동안은 winemenubuilder 를 끈다 (기본 RunServices 의 "-a" 가 공유 이름의
+        # wine-extension-*.desktop 을 덮어쓰기 때문)
+        (
+            export WINEDLLOVERRIDES="winemenubuilder.exe=d${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+            "$WINE" wineboot -u >/dev/null 2>&1
+            "$WINESERVER" -w
+            wine_id > "$PREFIX/.wiku-wine"
+            setup_prefix
+        ) || exit 1
+        rm -f "$PREFIX/.wiku-prefix.tmp"
+        rm -rf "$template.tmp"; mkdir -p "$TEMPLATES"
+        if cp -a --reflink=auto "$PREFIX" "$template.tmp" && mv -T "$template.tmp" "$template"; then
+            say "템플릿 저장: $template"
+            gc_templates
+        fi
+    elif [ "$(cat "$PREFIX/.wiku-prefix" 2>/dev/null)" != "$key" ]; then
+        setup_prefix
+        say "prefix 설정 갱신: $PREFIX"
+    fi
+}
+
+# ---------------------------------------------------------------- main
+
+case "${1:-}" in
+    list) list; exit 0 ;;
+    wines) wines; exit 0 ;;
+    add) shift; cmd_add "$@"; exit 0 ;;
+    set) shift; cmd_set "$@"; exit 0 ;;
+    rm) shift; cmd_rm "$@"; exit 0 ;;
+    --kill-all) kill_all; exit 0 ;;
+    -h|--help|help|"") usage; exit 0 ;;
+esac
+
+# prefix 고르기: 첫 인자가 prefix 이름 > WINEPREFIX 가 설정된 prefix 경로 > 기본 prefix
+NAME="" PREFIX=""
+if has_prefix "$1"; then
+    NAME="$1"; shift
+elif [ -n "${WINEPREFIX:-}" ]; then
+    while IFS= read -r n; do
+        [ "$(prefix_dir "$n")" = "${WINEPREFIX%/}" ] && { NAME="$n"; break; }
+    done < <(names)
+    if [ -z "$NAME" ]; then
+        NAME=$(default_prefix) PREFIX="${WINEPREFIX%/}"
+        [ -n "$NAME" ] || die "WINEPREFIX=$PREFIX 는 설정에 없는 prefix 이고 기본 prefix 도 없음"
+        say "WINEPREFIX=$PREFIX 는 설정에 없는 prefix -> '$NAME' 설정으로 실행"
+    fi
+else
+    NAME=$(default_prefix)
+    [ -n "$NAME" ] || die "기본 prefix 가 없음: wiku <prefix> ... 로 실행 ('wiku list' 참고)"
+fi
+[ $# -gt 0 ] || { usage; exit 0; }
+
+load "$NAME"
+[ -x "$WINE" ] || die "$RT 에 wine 이 없음"
+
+export WINEPREFIX="$PREFIX"
+export WINEMENUBUILDER_LAUNCHER="${WIKU_SELF:-wiku}"
+LOCALE="${WIKU_LANG:-$LOCALE}"
+[ -n "$LOCALE" ] && export LANG="$LOCALE" LC_ALL="$LOCALE"
+# Wayland 전용: X11 드라이버가 못 뜨게 (레지스트리 Graphics=wayland 는 share/wiku.reg)
+[ "$WAYLAND" = true ] && unset DISPLAY
+
+case "$1" in
+    --kill) kill_prefix "$PREFIX" "$WINESERVER"; exit 0 ;;
+esac
+
+sync_override
+if [ "$1" = --reset ]; then
+    shift
+    reset_prefix
+    ensure_prefix
+    [ $# -eq 0 ] && exit 0
+fi
+ensure_prefix
+exec "$WINE" "$@"

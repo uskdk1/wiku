@@ -1,0 +1,62 @@
+# 패치셋 저장소가 부르는 재사용 워크플로: flake 패키지를 빌드해서 cachix 에 올린다.
+# 사용자가 nix run / home-manager 로 받을 때 패치된 모듈·DXVK 를 직접 컴파일하지 않게 하려는 것.
+# cache.nixos.org 에 이미 있는 경로(vanilla wine 등)는 cachix 가 올리지 않는다.
+#
+# 패치셋 저장소의 .github/workflows/build.yml 예:
+#
+#   on: { push: { branches: [master] }, pull_request: {}, workflow_dispatch: {} }
+#   jobs:
+#     build:
+#       uses: uskdk1/wiku/.github/workflows/build.yml@master
+#       with:
+#         cachix: winemiku
+#         packages: winemiku winemiku-unpatched wine-miku-modules
+#       secrets:
+#         CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      cachix:
+        description: cachix 캐시 이름
+        required: true
+        type: string
+      packages:
+        description: 빌드할 flake 패키지 이름들 (공백으로 구분, 예 "winemiku wine-miku-modules")
+        required: true
+        type: string
+      timeout:
+        description: 분 단위 제한 시간
+        required: false
+        type: number
+        default: 180
+    secrets:
+      CACHIX_AUTH_TOKEN:
+        description: cachix 쓰기 토큰. 없으면(포크의 PR 등) 받기만 하고 올리지 않는다
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            accept-flake-config = true
+
+      - uses: cachix/cachix-action@v16
+        with:
+          name: ${{ inputs.cachix }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build
+        env:
+          PACKAGES: ${{ inputs.packages }}
+        run: |
+          args=()
+          for p in $PACKAGES; do args+=(".#$p"); done
+          nix build --print-build-logs --keep-going "${args[@]}"
