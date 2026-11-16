@@ -43,8 +43,8 @@ let
         type = types.nullOr types.bool;
         default = null;
         description = ''
-          Wine 파일 연결(~/.local/share/applications/wine-extension-*.desktop) 만들기.
-          파일 이름이 모든 prefix 공통이라 켠 prefix 끼리 덮어쓴다. null 이면 변형의 기본값 (wiku 기본: 끔)
+          Wine 파일 연결(이 prefix 에 설치한 앱으로 파일 열기) 도 앱 메뉴와 함께 만들기
+          (~/.local/share/applications/wiku/<이름>/). null 이면 변형의 기본값 (wiku 기본: 끔)
         '';
       };
       env = mkOption {

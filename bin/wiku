@@ -7,6 +7,7 @@
 #   wiku kakao "C:\\...\\앱.lnk"     설치한 앱 (바로가기 .lnk 또는 .exe)
 #   wiku kakao --reset [app.exe]     prefix 초기화 (drive_c, 레지스트리, 메뉴 항목) + 바로 실행
 #   wiku kakao --kill                이 prefix 의 Wine 프로세스 전부 종료 (트레이에 숨은 앱 포함)
+#   wiku kakao --menus               앱 메뉴 다시 만들기 (보통은 실행이 끝날 때 알아서)
 #   wiku --kill-all                  설정된 Wine 들로 뜬 모든 prefix 의 프로세스 종료
 #   WIKU_LANG=ja_JP.UTF-8 wiku ...   이번만 로캘 바꾸기
 #
@@ -19,13 +20,14 @@
 #     옵션: --wine <wine>  --locale <LANG|default>  --wayland <on|off|default>
 #           --dxvk <on|off|default>  --file-assoc <on|off|default>  --path <디렉터리|default>
 #           --env K=V  --unset-env K
-#     file-assoc: Wine 파일 연결(.reg, .chm 등을 Wine 으로 열기) 만들기. 이름이 prefix 공통이라
-#                 켠 prefix 끼리 덮어쓴다. 기본은 끔
+#     file-assoc: Wine 파일 연결(이 prefix 의 앱으로 파일 열기)도 만들기. 기본은 끔
 #
 # 설정: 래퍼가 넘기는 WIKU_CONFIG (nix store, home.nix 에서 선언한 wine/prefix) +
-#       ~/.config/wiku/prefixes.json (wiku add/set 으로 만든 prefix). 이름이 겹치면 home.nix 쪽.
-# 앱 바로가기(.desktop)는 `env WINEPREFIX=<경로> wiku ...` 로 부르므로 (WINEMENUBUILDER_LAUNCHER)
-# 첫 인자가 prefix 이름이 아니면 WINEPREFIX 로 prefix 를 찾는다.
+#       $XDG_CONFIG_HOME/wiku/prefixes.json (wiku add/set 으로 만든 prefix). 이름이 겹치면 home.nix 쪽.
+# 앱 메뉴: Wine 의 winemenubuilder 는 꺼 두고 (모든 prefix 공통 경로에 써서 서로 덮어씀), 실행이
+# 끝나면 wiku 가 prefix 의 시작 메뉴 바로가기(.lnk)로 $XDG_DATA_HOME/applications/wiku/<이름>/ 에
+# 만든다. 이름에 "(prefix)" 를 붙이고, `env WINEPREFIX=<경로> wiku ...` 로 부르므로 첫 인자가
+# prefix 이름이 아니면 WINEPREFIX 로 prefix 를 찾는다.
 # prefix 가 없으면 깨끗한 템플릿(~/.cache/wiku/templates, Wine+설정이 같은 prefix 끼리 공유)에서
 # 즉시 만들고, Wine 이 바뀌면 wineboot -u 로 갱신한다 (Nix store mtime 이 1 이라 Wine 이 스스로 못 한다).
 set -o pipefail
@@ -77,7 +79,7 @@ load() {
         .prefixes[$p] as $x | .wines[$x.wine] as $w
         | ($w.defaults + ($x | with_entries(select((.key | IN("locale", "wayland", "dxvk", "fileAssoc"))
                                                    and .value != null)))) as $s
-        | @sh "WINE_NAME=\($x.wine) RT=\($w.runtime) SHARE=\($w.shares["\($s.wayland)-\($s.dxvk)-\($s.fileAssoc)"])",
+        | @sh "WINE_NAME=\($x.wine) RT=\($w.runtime) SHARE=\($w.shares["\($s.wayland)-\($s.dxvk)"])",
           @sh "LOCALE=\($s.locale // "") WAYLAND=\($s.wayland) DXVK=\($s.dxvk) FILE_ASSOC=\($s.fileAssoc)",
           @sh "OVERRIDE=\($x.override // "") SOURCE=\($x.source)",
           (($w.env + ($x.env // {})) | to_entries[] | "export \(.key)=\(.value | @sh)")')" ||
@@ -290,19 +292,150 @@ gc_templates() {
     done
 }
 
-# 이 prefix 를 가리키는 앱 메뉴 항목(.desktop / .menu) 삭제. 다른 prefix 것은 건드리지 않는다
-clean_menus() {
-    local apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+# ---------------------------------------------------------------- 앱 메뉴
+
+APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+MIME="${XDG_DATA_HOME:-$HOME/.local/share}/mime"
+MENUS_VERSION=1   # 만드는 방식이 바뀌면 올린다 (모든 prefix 의 메뉴를 다시 만들게)
+
+# Wine(winemenubuilder)이 예전에 공통 경로에 만든 이 prefix 의 항목 삭제 (.desktop / .menu)
+clean_wine_menus() {
     local menus="${XDG_CONFIG_HOME:-$HOME/.config}/menus/applications-merged"
     local f id n=0
-    [ -d "$apps" ] || return 0
+    [ -d "$APPS" ] || return 0
     while IFS= read -r -d '' f; do
-        id="${f#"$apps"/}"; id="${id//\//-}"
+        [[ "$f" = "$APPS/wiku/"* ]] && continue
+        id="${f#"$APPS"/}"; id="${id//\//-}"
         rm -f "$f" "$menus/${id%.desktop}.menu"
         n=$((n + 1))
-    done < <(grep -rlZF --include='*.desktop' "\"WINEPREFIX=$PREFIX\"" "$apps" 2>/dev/null)
-    find "$apps/wine" -mindepth 1 -type d -empty -delete 2>/dev/null
-    [ $n -gt 0 ] && say "메뉴 항목 ${n}개 삭제"
+    done < <(grep -rlZF --include='*.desktop' "\"WINEPREFIX=$PREFIX\"" "$APPS" 2>/dev/null)
+    find "$APPS/wine" -mindepth 1 -type d -empty -delete 2>/dev/null
+    [ $n -gt 0 ] && say "Wine 이 만든 예전 메뉴 항목 ${n}개 삭제"
+    return 0
+}
+
+# 파일 연결이 바뀌었으면 데스크톱·MIME 데이터베이스 갱신
+update_assoc_db() {
+    [ -d "$MIME/packages" ] && update-mime-database "$MIME" >/dev/null 2>&1
+    [ -d "$APPS" ] && update-desktop-database "$APPS" >/dev/null 2>&1
+    return 0
+}
+
+# 이 prefix 의 앱 메뉴 전부 삭제 (wiku 가 만든 것 + Wine 이 예전에 만든 것). 다른 prefix 것은 그대로
+clean_menus() {
+    local assoc=0
+    # 설정에 없는 경로(WINEPREFIX)로 실행한 경우엔 그 이름의 메뉴는 남의 것
+    [ "${MENUS_OK:-1}" = 1 ] || { clean_wine_menus; return 0; }
+    [ -d "$APPS/wiku/$NAME" ] && grep -rqs '^MimeType=' "$APPS/wiku/$NAME" && assoc=1
+    if [ -d "$APPS/wiku/$NAME" ]; then rm -rf "$APPS/wiku/$NAME"; say "앱 메뉴 삭제: $NAME"; fi
+    exists "$MIME/packages/wiku-$NAME@"* && { rm -f "$MIME/packages/wiku-$NAME@"*; assoc=1; }
+    rmdir "$APPS/wiku" 2>/dev/null
+    rm -f "$PREFIX/.wiku-menus"
+    clean_wine_menus
+    [ $assoc = 1 ] && update_assoc_db
+    return 0
+}
+
+# prefix 안의 시작 메뉴 디렉터리들 (사용자별 + 모든 사용자 공통)
+start_menu_dirs() {
+    find "$PREFIX/drive_c/users" "$PREFIX/drive_c/ProgramData" -maxdepth 6 -type d \
+        -path '*/Microsoft/Windows/Start Menu' 2>/dev/null
+}
+
+# 바로가기 목록과 설정이 같으면 다시 만들지 않는다
+menus_sig() {
+    {
+        echo "$MENUS_VERSION $FILE_ASSOC ${WIKU_SELF:-wiku} $PREFIX $(wine_id)"
+        start_menu_dirs | while IFS= read -r d; do
+            find "$d" -type f -iname '*.lnk' -printf '%p %T@ %s\n'
+        done | sort
+        # 파일 연결은 레지스트리에 있다 (Wine 이 레지스트리 파일을 쓸 때마다 다시 만든다)
+        [ "$FILE_ASSOC" = true ] && stat -c '%Y' "$PREFIX/system.reg" "$PREFIX/user.reg" 2>/dev/null
+    } | sha256sum | cut -d' ' -f1
+}
+
+# 글롭이 실제 파일에 맞았는지 (맞는 게 없으면 패턴 그대로 들어온다)
+exists() { [ -e "${1:-}" ]; }
+
+sed_esc() { printf '%s' "$1" | sed 's/[\\|&]/\\&/g'; }
+
+# Wine 이 만든 .desktop 하나를 wiku 용으로 고쳐 쓴다: 실행기를 wiku 로, 이름에 (prefix), 아이콘은
+# 가장 큰 PNG 를 prefix 안(.wiku-icons)에 두고 절대 경로로
+fix_entry() {
+    local src="$1" dst="$2" work="$3" icon png icons="$PREFIX/.wiku-icons" args=()
+    icon=$(sed -n 's/^Icon=//p' "$src" | head -1)
+    if [ -n "$icon" ]; then
+        png=$(find "$work/data/icons" -type f -name "$icon.png" 2>/dev/null |
+            sed 's|.*/\([0-9]*\)x[0-9]*/apps/[^/]*$|\1 &|' | sort -n | tail -1 | cut -d' ' -f2-)
+        if [ -n "$png" ]; then
+            mkdir -p "$work/icons"; cp -f "$png" "$work/icons/$icon.png"
+            args+=(-e "s|^Icon=.*|Icon=$(sed_esc "$icons/$icon.png")|")
+        fi
+    fi
+    mkdir -p "$(dirname "$dst")"
+    sed -e "s|^\(Exec=env \"WINEPREFIX=[^\"]*\"\) wine |\1 $(sed_esc "\"${WIKU_SELF:-wiku}\"") |" \
+        -e "s|^Exec=wine |Exec=$(sed_esc "\"${WIKU_SELF:-wiku}\"") |" \
+        -e "s|^Name=\(.*\)|Name=\1 ($NAME)|" "${args[@]}" "$src" > "$dst"
+}
+
+# prefix 의 시작 메뉴 바로가기(.lnk)로 앱 메뉴를 만든다 ($APPS/wiku/<이름>/).
+# winemenubuilder 를 이번 한 번만 켜고, XDG 경로를 임시 디렉터리로 줘서 결과만 받아 고쳐 쓴다
+# (Wine 안에서 뜨는 다른 프로그램은 진짜 XDG 경로 그대로). 인자 force: 바뀐 게 없어도
+sync_menus() {
+    local force="${1:-}" sig work f rel dest="$APPS/wiku/$NAME" n=0 assoc=0 lnks=()
+    [ "$MENUS_OK" = 1 ] && [ -d "$PREFIX/drive_c" ] || return 0
+    sig=$(menus_sig)
+    [ "$force" = force ] || [ "$(cat "$PREFIX/.wiku-menus" 2>/dev/null)" != "$sig" ] || return 0
+    work=$(mktemp -d "${TMPDIR:-/tmp}/wiku-menus.XXXXXX") || return 0
+    # C:\ 경로로 넘겨야 winemenubuilder 가 시작 메뉴 안의 바로가기로 안다
+    while IFS= read -r -d '' f; do
+        rel="${f#"$PREFIX/drive_c/"}"
+        lnks+=("C:\\${rel//\//\\}")
+    done < <(start_menu_dirs | while IFS= read -r d; do find "$d" -type f -iname '*.lnk' -print0; done)
+    (
+        export XDG_DATA_HOME="$work/data" XDG_CONFIG_HOME="$work/config"
+        export WINEDLLOVERRIDES="winemenubuilder.exe=b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+        unset WINEMENUBUILDER_LAUNCHER
+        mkdir -p "$XDG_DATA_HOME" "$XDG_CONFIG_HOME"
+        if [ "$FILE_ASSOC" = true ]; then
+            # 이미 만든 연결은 다시 쓰지 않으므로 기록을 지우고 처음부터
+            "$WINE" reg delete 'HKCU\Software\Wine\FileOpenAssociations' /f >/dev/null 2>&1
+            "$WINE" winemenubuilder.exe -a >/dev/null 2>&1
+        fi
+        [ ${#lnks[@]} -eq 0 ] || "$WINE" winemenubuilder.exe -w "${lnks[@]}" >/dev/null 2>&1
+        true
+    )
+    mkdir -p "$work/out"
+    # 앱 메뉴: applications/wine/<시작 메뉴 경로>.desktop
+    if [ -d "$work/data/applications/wine" ]; then
+        while IFS= read -r -d '' f; do
+            rel="${f#"$work/data/applications/wine/"}"
+            fix_entry "$f" "$work/out/$rel" "$work"; n=$((n + 1))
+        done < <(find "$work/data/applications/wine" -type f -name '*.desktop' -print0)
+    fi
+    # 파일 연결: applications/wine-{extension,protocol}-*.desktop + mime/packages/*.xml
+    while IFS= read -r -d '' f; do
+        fix_entry "$f" "$work/out/${f##*/}" "$work"; assoc=1
+    done < <(find "$work/data/applications" -maxdepth 1 -type f -name 'wine-*.desktop' -print0 2>/dev/null)
+    [ -d "$APPS/wiku/$NAME" ] && grep -rqs '^MimeType=' "$APPS/wiku/$NAME" && assoc=1
+    exists "$MIME/packages/wiku-$NAME@"* && { rm -f "$MIME/packages/wiku-$NAME@"*; assoc=1; }
+    if exists "$work/data/mime/packages/"*.xml; then
+        mkdir -p "$MIME/packages"
+        for f in "$work/data/mime/packages/"*.xml; do cp -f "$f" "$MIME/packages/wiku-$NAME@${f##*/}"; done
+    fi
+    # 통째로 바꾼다 (지운 앱의 항목은 사라진다)
+    rm -rf "$dest" "$PREFIX/.wiku-icons"
+    if [ -n "$(ls -A "$work/out")" ]; then
+        mkdir -p "$APPS/wiku"; cp -r "$work/out" "$dest"
+        [ -d "$work/icons" ] && cp -r "$work/icons" "$PREFIX/.wiku-icons"
+    fi
+    rmdir "$APPS/wiku" 2>/dev/null
+    rm -rf "$work"
+    clean_wine_menus
+    [ $assoc = 1 ] && update_assoc_db
+    echo "$sig" > "$PREFIX/.wiku-menus"
+    [ "$(cat "$PREFIX/.wiku-menus-n" 2>/dev/null || echo 0)" = "$n" ] || say "앱 메뉴: $NAME 에 ${n}개"
+    echo "$n" > "$PREFIX/.wiku-menus-n"
     return 0
 }
 
@@ -362,11 +495,6 @@ setup_prefix() {
         for f in "$SHARE"/fonts/*; do
             ln -sfn "$f" "$PREFIX/drive_c/windows/Fonts/${f##*/}"
         done
-    fi
-    # 파일 연결을 껐으면 이 prefix 가 예전에 만든 wine-extension-*.desktop 을 지운다 (앱 메뉴는 그대로)
-    if [ "$FILE_ASSOC" != true ]; then
-        local apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-        grep -lZF "\"WINEPREFIX=$PREFIX\"" "$apps"/wine-extension-*.desktop 2>/dev/null | xargs -0 -r rm -f
     fi
     # 레지스트리: 변형의 prefix.reg 다음에 wiku 토글(wiku.reg) -> 토글이 이긴다
     for f in prefix.reg wiku.reg; do
@@ -448,8 +576,11 @@ fi
 
 load "$NAME"
 [ -x "$WINE" ] || die "$RT 에 wine 이 없음"
+# 앱 메뉴는 설정에 있는 경로의 prefix 만 ($APPS/wiku/<이름>/ 이 이름으로 정해지므로)
+MENUS_OK=0; [ "$PREFIX" = "$(prefix_dir "$NAME")" ] && MENUS_OK=1
 
 export WINEPREFIX="$PREFIX"
+# (winemenubuilder 를 켠 변형이 있을 때 대비. wiku 는 sync_menus 에서 고쳐 쓴다)
 export WINEMENUBUILDER_LAUNCHER="${WIKU_SELF:-wiku}"
 LOCALE="${WIKU_LANG:-$LOCALE}"
 [ -n "$LOCALE" ] && export LANG="$LOCALE" LC_ALL="$LOCALE"
@@ -468,4 +599,9 @@ if [ "$1" = --reset ]; then
     [ $# -eq 0 ] && exit 0
 fi
 ensure_prefix
-exec "$WINE" "$@"
+if [ "$1" = --menus ]; then sync_menus force; exit 0; fi
+# exec 하지 않고 기다렸다가 (설치기가 끝나면) 앱 메뉴를 맞춘다
+"$WINE" "$@"
+rc=$?
+sync_menus
+exit $rc

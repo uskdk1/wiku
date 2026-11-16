@@ -13,6 +13,7 @@ wiku app.exe                     # 기본 prefix
 wiku kakao app.exe               # kakao prefix
 wiku kakao --reset [app.exe]     # 초기화
 wiku kakao --kill                # 이 prefix의 Wine 종료
+wiku kakao --menus               # 앱 메뉴 다시 만들기 (보통은 실행이 끝날 때 알아서)
 wiku --kill-all                  # 설정된 Wine들로 뜬 모든 prefix 종료
 
 wiku list                        # prefix 목록 (* 기본, home/user, ! 설정에 없는 데이터)
@@ -24,13 +25,24 @@ wiku rm game [-y]                # prefix 데이터·메뉴 항목 삭제 (add�
 
 | 위치 | 내용 |
 |---|---|
-| `~/.local/share/wiku/<이름>` | prefix (`path`로 바꿀 수 있음) |
-| `~/.cache/wiku/templates/<key>` | 깨끗한 prefix 템플릿. Wine+설정이 같은 prefix끼리 공유, 안 쓰는 것은 자동 삭제 |
-| `~/.config/wiku/prefixes.json` | `wiku add/set`으로 만든 prefix |
+| `$XDG_DATA_HOME/wiku/<이름>` | prefix (`path`로 바꿀 수 있음) |
+| `$XDG_DATA_HOME/applications/wiku/<이름>/` | 이 prefix의 앱 메뉴 (`카카오톡 (kakao)`) |
+| `$XDG_CACHE_HOME/wiku/templates/<key>` | 깨끗한 prefix 템플릿. Wine+설정이 같은 prefix끼리 공유, 안 쓰는 것은 자동 삭제 |
+| `$XDG_CONFIG_HOME/wiku/prefixes.json` | `wiku add/set`으로 만든 prefix |
+
+(XDG 변수가 없으면 `~/.local/share`, `~/.cache`, `~/.config`)
 
 prefix 설정: `locale`, `wayland`(DISPLAY 제거 + Graphics=wayland), `dxvk`(변형의 DXVK 설치),
-`fileAssoc`(Wine 파일 연결 `wine-extension-*.desktop`. 이름이 prefix 공통이라 기본은 끔),
-`env`, `path`. 지정하지 않으면 변형의 기본값.
+`fileAssoc`(이 prefix의 앱으로 파일 열기도 만들기, 기본은 끔), `env`, `path`.
+지정하지 않으면 변형의 기본값.
+
+### 앱 메뉴
+
+Wine의 winemenubuilder는 모든 prefix의 바로가기를 같은 경로에 써서 서로 덮어쓰므로 꺼 둔다.
+대신 wiku로 띄운 프로그램(설치기 등)이 끝나면 wiku가 prefix의 시작 메뉴 바로가기(.lnk)로
+`applications/wiku/<이름>/`에 메뉴를 만든다: 이름에 `(prefix)`, 실행은 `env WINEPREFIX=… wiku …`.
+지운 앱의 항목은 다음에 만들 때 사라지고, `wiku rm`·`--reset`은 이 디렉터리를 지운다.
+변형에 따로 패치가 필요 없다.
 
 ## home-manager
 

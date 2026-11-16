@@ -134,7 +134,7 @@ let
   fontDirs = lib.toList (prefix.fonts or [ ]);
 
   # prefix 설정(토글)에 따른 데이터 디렉터리
-  #   wiku.reg    wiku 토글 (Graphics=wayland, DXVK override, winemenubuilder 옵션).
+  #   wiku.reg    wiku 토글 (Graphics=wayland, DXVK override) + winemenubuilder 끄기.
   #               변형의 prefix.reg 다음에 적용
   #   prefix.reg  변형이 준 레지스트리 (있으면)
   #   fonts/      변형이 준 폰트 디렉터리들의 파일 링크 (있으면. 이름이 겹치면 빌드 오류)
@@ -150,17 +150,18 @@ let
         ""
         ''[HKEY_CURRENT_USER\Software\Wine\DllOverrides]''
       ] ++ map (d: line d (if s.dxvk then ''"native,builtin"'' else "-")) dxvkDlls ++ [
+        # Wine 의 winemenubuilder 끄기: 앱 메뉴·파일 연결을 모든 prefix 공통 경로
+        # (applications/wine/..., wine-extension-*.desktop)에 써서 prefix 끼리 덮어쓴다.
+        # 앱 메뉴는 wiku 가 prefix 별로 따로 만든다 (bin/wiku 의 sync_menus)
+        (line "winemenubuilder.exe" ''""'')
         ""
-        # 세션 시작마다 도는 winemenubuilder. 기본값 "-a -r" 의 -a 는 Wine 파일 연결
-        # (~/.local/share/applications/wine-extension-*.desktop)을 만드는데, 파일 이름이 모든 prefix
-        # 공통이라 마지막에 실행한 prefix 가 덮어쓴다 -> fileAssoc 를 켠 prefix 만 -a
+        # 세션 시작마다 돌던 winemenubuilder -a -r 도 지운다
         ''[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\RunServices]''
-        (line "winemenubuilder"
-          ''"C:\\windows\\system32\\winemenubuilder.exe ${if s.fileAssoc then "-a -r" else "-r"}"'')
+        (line "winemenubuilder" "-")
         ""
       ]));
     in
-    pkgs.runCommand "wiku-${name}-share${lib.optionalString s.wayland "-wayland"}${lib.optionalString s.dxvk "-dxvk"}${lib.optionalString s.fileAssoc "-assoc"}" { } ''
+    pkgs.runCommand "wiku-${name}-share${lib.optionalString s.wayland "-wayland"}${lib.optionalString s.dxvk "-dxvk"}" { } ''
       mkdir -p $out
       cp ${wikuReg} $out/wiku.reg
       ${lib.optionalString (prefix ? reg) "ln -s ${prefix.reg} $out/prefix.reg"}
@@ -184,11 +185,11 @@ let
       locale = null; # null 이면 실행 환경의 LANG 그대로
       wayland = false;
       dxvk = true;
-      fileAssoc = false; # Wine 파일 연결(.desktop) 만들기. prefix 끼리 덮어써서 기본은 끔
+      fileAssoc = false; # Wine 파일 연결(.reg 등을 Wine 앱으로 열기) 도 앱 메뉴와 함께 만들기
     } // defaults;
     env = if lib.isFunction env then env { inherit dxvk runtime; } else env;
     version = base.version;
-    # { wayland, dxvk, fileAssoc } -> prefix 데이터. 이 변형의 pkgs 로 만든다 (CI 캐시와 같은 경로)
+    # { wayland, dxvk } -> prefix 데이터. 이 변형의 pkgs 로 만든다 (CI 캐시와 같은 경로)
     inherit share;
   };
 in
