@@ -41,6 +41,8 @@ prefix 설정: `locale`, `wayland`(DISPLAY 제거 + Graphics=wayland), `dxvk`(�
 Wine의 winemenubuilder는 모든 prefix의 바로가기를 같은 경로에 써서 서로 덮어쓰므로 꺼 둔다.
 대신 wiku로 띄운 프로그램(설치기 등)이 끝나면 wiku가 prefix의 시작 메뉴 바로가기(.lnk)로
 `applications/wiku/<이름>/`에 메뉴를 만든다: 이름에 `(prefix)`, 실행은 `env WINEPREFIX=… wiku …`.
+설치기가 먼저 끝나고 자식 프로세스가 나중에 바로가기를 만드는 경우를 위해, 그 뒤에도 백그라운드에서
+5초마다 바로가기 목록을 본다 (그 prefix의 Wine이 모두 끝나거나 10분이 지나면 멈춤).
 지운 앱의 항목은 다음에 만들 때 사라지고, `wiku rm`·`--reset`은 이 디렉터리를 지운다.
 변형에 따로 패치가 필요 없다.
 

@@ -330,7 +330,7 @@ clean_menus() {
     if [ -d "$APPS/wiku/$NAME" ]; then rm -rf "$APPS/wiku/$NAME"; say "앱 메뉴 삭제: $NAME"; fi
     exists "$MIME/packages/wiku-$NAME@"* && { rm -f "$MIME/packages/wiku-$NAME@"*; assoc=1; }
     rmdir "$APPS/wiku" 2>/dev/null
-    rm -f "$PREFIX/.wiku-menus"
+    rm -f "$PREFIX/.wiku-menus" "$PREFIX/.wiku-menus-retry"
     clean_wine_menus
     [ $assoc = 1 ] && update_assoc_db
     return 0
@@ -342,6 +342,13 @@ start_menu_dirs() {
         -path '*/Microsoft/Windows/Start Menu' 2>/dev/null
 }
 
+# 레지스트리 파일에서 Software\Classes 아래(파일 연결) 내용만. 키마다 붙는 시각(머리줄 끝의 숫자,
+# #time=)은 뺀다. 그래야 앱을 실행하거나 sync_menus 가 다른 키를 고쳐도 값이 그대로다
+reg_classes() {
+    awk '/^\[/ { keep = ($0 ~ /^\[Software\\\\Classes\\\\/); if (keep) sub(/\] [0-9]+$/, "]") }
+         keep && !/^#time=/' "$PREFIX/system.reg" "$PREFIX/user.reg" 2>/dev/null
+}
+
 # 바로가기 목록과 설정이 같으면 다시 만들지 않는다
 menus_sig() {
     {
@@ -349,9 +356,35 @@ menus_sig() {
         start_menu_dirs | while IFS= read -r d; do
             find "$d" -type f -iname '*.lnk' -printf '%p %T@ %s\n'
         done | sort
-        # 파일 연결은 레지스트리에 있다 (Wine 이 레지스트리 파일을 쓸 때마다 다시 만든다)
-        [ "$FILE_ASSOC" = true ] && stat -c '%Y' "$PREFIX/system.reg" "$PREFIX/user.reg" 2>/dev/null
+        [ "$FILE_ASSOC" = true ] && reg_classes
     } | sha256sum | cut -d' ' -f1
+}
+
+# 이 prefix 의 wineserver 가 떠 있는지
+server_alive() {
+    local pid
+    for pid in $(pgrep -x wineserver); do
+        tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qxF "WINEPREFIX=$PREFIX" && return 0
+    done
+    return 1
+}
+
+# 실행이 끝난 뒤에도 바로가기가 생기는 경우 (설치기가 자식 프로세스만 띄우고 먼저 끝나는 등):
+# 백그라운드에서 5초마다 바로가기 목록만 보고, 바뀌면 메뉴를 다시 만든다. 이 prefix 의 Wine 이
+# 모두 끝나거나 10분이 지나면 멈춘다. prefix 마다 하나만 (이미 있으면 그쪽이 계속 본다)
+watch_menus() {
+    [ "$MENUS_OK" = 1 ] && [ -d "$PREFIX/drive_c" ] || return 0
+    (
+        exec {lock}>"$PREFIX/.wiku-watch.lock" && flock -n "$lock" || exit 0
+        local i
+        for ((i = 0; i < 120; i++)); do
+            sleep 5
+            if ! server_alive; then sync_menus; exit 0; fi
+            sync_menus
+        done
+    ) </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null
+    return 0
 }
 
 # 글롭이 실제 파일에 맞았는지 (맞는 게 없으면 패턴 그대로 들어온다)
@@ -382,10 +415,28 @@ fix_entry() {
 # winemenubuilder 를 이번 한 번만 켜고, XDG 경로를 임시 디렉터리로 줘서 결과만 받아 고쳐 쓴다
 # (Wine 안에서 뜨는 다른 프로그램은 진짜 XDG 경로 그대로). 인자 force: 바뀐 게 없어도
 sync_menus() {
-    local force="${1:-}" sig work f rel dest="$APPS/wiku/$NAME" n=0 assoc=0 lnks=()
+    local force="${1:-}" sig lock cur
     [ "$MENUS_OK" = 1 ] && [ -d "$PREFIX/drive_c" ] || return 0
     sig=$(menus_sig)
-    [ "$force" = force ] || [ "$(cat "$PREFIX/.wiku-menus" 2>/dev/null)" != "$sig" ] || return 0
+    if [ "$force" != force ]; then
+        cur=$(cat "$PREFIX/.wiku-menus" 2>/dev/null)
+        [ "$cur" = "$sig" ] && return 0
+        # 아이콘 재시도 대기 중: 지난 시도에서 1분이 지나야 다시 (백그라운드 확인이 5초마다 돌므로)
+        if [ "$cur" = "$sig retry" ] &&
+            [ $(( $(date +%s) - $(stat -c %Y "$PREFIX/.wiku-menus") )) -lt 60 ]; then
+            return 0
+        fi
+    fi
+    # 앞에서 실행한 wiku 와 백그라운드 확인이 동시에 만들지 않게
+    exec {lock}>"$PREFIX/.wiku-menus.lock"
+    flock -w 120 "$lock" || { exec {lock}>&-; return 0; }
+    build_menus "$sig"
+    exec {lock}>&-
+    return 0
+}
+
+build_menus() {
+    local sig="$1" work f rel dest="$APPS/wiku/$NAME" n=0 assoc=0 lnks=()
     work=$(mktemp -d "${TMPDIR:-/tmp}/wiku-menus.XXXXXX") || return 0
     # C:\ 경로로 넘겨야 winemenubuilder 가 시작 메뉴 안의 바로가기로 안다
     while IFS= read -r -d '' f; do
@@ -397,12 +448,16 @@ sync_menus() {
         export WINEDLLOVERRIDES="winemenubuilder.exe=b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
         unset WINEMENUBUILDER_LAUNCHER
         mkdir -p "$XDG_DATA_HOME" "$XDG_CONFIG_HOME"
+        # (혹시 멈추면 끊는다: Wine 이 내는 창이나 잠금 때문에 영원히 기다리지 않게)
         if [ "$FILE_ASSOC" = true ]; then
             # 이미 만든 연결은 다시 쓰지 않으므로 기록을 지우고 처음부터
-            "$WINE" reg delete 'HKCU\Software\Wine\FileOpenAssociations' /f >/dev/null 2>&1
-            "$WINE" winemenubuilder.exe -a >/dev/null 2>&1
+            timeout 60 "$WINE" reg delete 'HKCU\Software\Wine\FileOpenAssociations' /f >/dev/null 2>&1
+            timeout 120 "$WINE" winemenubuilder.exe -a >/dev/null 2>&1
         fi
-        [ ${#lnks[@]} -eq 0 ] || "$WINE" winemenubuilder.exe -w "${lnks[@]}" >/dev/null 2>&1
+        # -w 는 쓰지 않는다: 아이콘을 못 뽑으면 (대상 exe 가 없는 바로가기 등) 부모 프로세스가
+        # 끝나기를 기다리는데, 그 부모(start.exe)는 winemenubuilder 를 기다려서 서로 멈춘다.
+        # -w 없이는 아이콘 없이 그냥 만든다
+        [ ${#lnks[@]} -eq 0 ] || timeout 120 "$WINE" winemenubuilder.exe "${lnks[@]}" >/dev/null 2>&1
         true
     )
     mkdir -p "$work/out"
@@ -433,7 +488,21 @@ sync_menus() {
     rm -rf "$work"
     clean_wine_menus
     [ $assoc = 1 ] && update_assoc_db
-    echo "$sig" > "$PREFIX/.wiku-menus"
+    # 만드는 동안 레지스트리를 고쳤으니 (파일 연결 기록 지우기) 저장할 서명은 지금 다시 계산한다
+    [ "$FILE_ASSOC" = true ] && sig=$(menus_sig)
+    # 아이콘을 못 뽑은 항목이 있으면 (exe 를 바로가기보다 늦게 복사하는 설치기 등) 서명에 표시를
+    # 남겨서 다음에 다시 만든다. 대상이 아예 없는 바로가기 때문에 끝없이 하지 않게 3번까지
+    local missing=0 rsig tries=0
+    [ -d "$dest" ] && missing=$(find "$dest" -name '*.desktop' -exec grep -L '^Icon=' {} + | wc -l)
+    read -r rsig tries < "$PREFIX/.wiku-menus-retry" 2>/dev/null || tries=0
+    [ "$rsig" = "$sig" ] || tries=0
+    if [ "$missing" -gt 0 ] && [ "$tries" -lt 3 ]; then
+        echo "$sig $((tries + 1))" > "$PREFIX/.wiku-menus-retry"
+        echo "$sig retry" > "$PREFIX/.wiku-menus"
+    else
+        [ "$missing" -gt 0 ] || rm -f "$PREFIX/.wiku-menus-retry"
+        echo "$sig" > "$PREFIX/.wiku-menus"
+    fi
     [ "$(cat "$PREFIX/.wiku-menus-n" 2>/dev/null || echo 0)" = "$n" ] || say "앱 메뉴: $NAME 에 ${n}개"
     echo "$n" > "$PREFIX/.wiku-menus-n"
     return 0
@@ -600,8 +669,21 @@ if [ "$1" = --reset ]; then
 fi
 ensure_prefix
 if [ "$1" = --menus ]; then sync_menus force; exit 0; fi
-# exec 하지 않고 기다렸다가 (설치기가 끝나면) 앱 메뉴를 맞춘다
-"$WINE" "$@"
-rc=$?
+# exec 하지 않고 기다렸다가 (설치기가 끝나면) 앱 메뉴를 맞춘다.
+# 백그라운드로 띄우고 wait: 그래야 wiku 가 받은 TERM/HUP 을 wine 에 넘길 수 있다.
+# (0<&0: 셸이 백그라운드 명령의 입력을 /dev/null 로 바꾸지 않게.
+# Ctrl-C: 비대화형 셸이 &로 띄운 명령은 SIGINT 를 무시한 채로 시작하지만, Wine(ntdll)이 시작할 때
+# SIGINT 처리기를 다시 걸므로 같은 프로세스 그룹의 wine 이 그대로 받는다. wiku 는 무시하고 기다린다)
+"$WINE" "$@" 0<&0 &
+pid=$!
+trap 'kill -TERM "$pid" 2>/dev/null' TERM
+trap 'kill -HUP "$pid" 2>/dev/null' HUP
+trap ':' INT
+rc=0
+wait "$pid"; rc=$?
+# 신호 때문에 wait 가 먼저 돌아오면 wine 이 끝날 때까지 다시 기다린다
+while kill -0 "$pid" 2>/dev/null; do wait "$pid"; rc=$?; done
+trap - TERM HUP INT
 sync_menus
+watch_menus
 exit $rc

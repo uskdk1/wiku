@@ -56,7 +56,8 @@ let
   # 실행기가 쓰는 명령들
   # (desktop-file-utils, shared-mime-info: 파일 연결을 만들 때 데이터베이스 갱신)
   path = lib.makeBinPath (with pkgs; [
-    coreutils findutils gnugrep gnused procps diffutils jq desktop-file-utils shared-mime-info
+    coreutils findutils gnugrep gnused gawk procps util-linux diffutils jq
+    desktop-file-utils shared-mime-info
   ]);
 
   config = pkgs.writeText "wiku-config.json" (builtins.toJSON {
