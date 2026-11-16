@@ -15,6 +15,8 @@ wiku kakao --reset [app.exe]     # 초기화
 wiku kakao --kill                # 이 prefix의 Wine 종료
 wiku kakao --menus               # 앱 메뉴 다시 만들기 (보통은 실행이 끝날 때 알아서)
 wiku --kill-all                  # 설정된 Wine들로 뜬 모든 prefix 종료
+wiku kakao --env                 # prefix만 맞추고 실행 환경 출력 (패치셋 개발 셸용)
+                                 #   eval "$(wiku kakao --env)" && "$WIKU_WINE" app.exe
 
 wiku list                        # prefix 목록 (* 기본, home/user, ! 설정에 없는 데이터)
 wiku wines                       # 변형 목록 (버전, 기본값, 쓰는 prefix)
